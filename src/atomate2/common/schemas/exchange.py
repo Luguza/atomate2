@@ -5,12 +5,42 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
+from pymatgen.analysis.magnetism.heisenberg import HeisenbergModel
 from pymatgen.core.structure import Structure
 
 if TYPE_CHECKING:
-    from pymatgen.analysis.magnetism.heisenberg import HeisenbergModel
-
     from atomate2.vampire.schemas.vampire_output import VampireOutput
+
+
+class ExchangeRound(BaseModel):
+    """Summary of the Heisenberg fit after one supercell round of orderings."""
+
+    cell_size: int = Field(
+        description="Supercell size, in parent cells, of this round's new orderings."
+    )
+    num_orderings: int = Field(
+        description="Number of orderings the fit used, from this and earlier rounds."
+    )
+    ex_params: dict[str, float] = Field(
+        description="Fitted J_ij in meV/muB^2 and 'E0' in eV per magnetic ion."
+    )
+    residual: float = Field(
+        description="RMS fit residual in meV per magnetic ion."
+    )
+    cv_error: float = Field(
+        description="Leave-one-out cross-validation RMS error in meV per magnetic ion."
+    )
+
+
+class ExchangeFit(BaseModel):
+    """Final Heisenberg model of the convergence loop and the summary of each round."""
+
+    heisenberg_model: HeisenbergModel = Field(
+        description="The model fitted on the orderings of all rounds."
+    )
+    rounds: list[ExchangeRound] = Field(
+        description="One summary per round, in the order the rounds ran."
+    )
 
 
 class ExchangeDocument(BaseModel):
@@ -63,6 +93,10 @@ class ExchangeDocument(BaseModel):
     )
     heisenberg_model: dict | None = Field(
         None, description="Full HeisenbergModel as a serialized dict (as_dict())."
+    )
+    rounds: list[ExchangeRound] | None = Field(
+        None,
+        description="Fit summary after each supercell round of the convergence loop.",
     )
     critical_temp: float | None = Field(
         None,
