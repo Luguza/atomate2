@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pymatgen.analysis.magnetism.heisenberg import HeisenbergModel
 from pymatgen.core.structure import Structure
 
 if TYPE_CHECKING:
     from atomate2.vampire.schemas.vampire_output import VampireOutput
 
+# JSON has no infinity; write `Infinity` so an infinite leave-one-out error reloads.
+KEEP_INFINITY = ConfigDict(ser_json_inf_nan="constants")
+
 
 class ExchangeRound(BaseModel):
     """Summary of the Heisenberg fit after one supercell round of orderings."""
+
+    model_config = KEEP_INFINITY
 
     cell_size: int = Field(
         description="Supercell size, in parent cells, of this round's new orderings."
@@ -27,13 +32,16 @@ class ExchangeRound(BaseModel):
     residual: float = Field(
         description="RMS fit residual in meV per magnetic ion."
     )
-    cv_error: float = Field(
-        description="Leave-one-out cross-validation RMS error in meV per magnetic ion."
+    leave_one_out_error: float = Field(
+        description="RMS error of predicting each ordering's energy from a fit to all "
+        "the others, in meV per magnetic ion; infinite if one ordering alone fixes a J."
     )
 
 
 class ExchangeFit(BaseModel):
     """Final Heisenberg model of the convergence loop and the summary of each round."""
+
+    model_config = KEEP_INFINITY
 
     heisenberg_model: HeisenbergModel = Field(
         description="The model fitted on the orderings of all rounds."
@@ -50,6 +58,8 @@ class ExchangeDocument(BaseModel):
     always populated; the Vampire fields are populated only if the Monte-Carlo
     critical-temperature step was run.
     """
+
+    model_config = KEEP_INFINITY
 
     formula: str | None = Field(
         None,

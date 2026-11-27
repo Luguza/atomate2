@@ -23,7 +23,6 @@ from atomate2.common.schemas.exchange import (
 )
 
 if TYPE_CHECKING:
-    import pandas as pd
     from emmet.core.tasks import TaskDoc
     from pymatgen.analysis.magnetism.heisenberg import HeisenbergModel
     from pymatgen.core.structure import Structure
@@ -38,8 +37,8 @@ FIRST_CELL_SIZE = 1
 FIRST_ROUND_STRATEGIES = ("ferromagnetic", "antiferromagnetic")
 LATER_ROUND_STRATEGIES = ("antiferromagnetic",)
 
-# DECISION 1: stop on the LOO-CV error, the J change between rounds, or both.
-StopRule = Literal["cv_error", "j_change", "both"]
+# DECISION 1: stop on the leave-one-out error, the J change between rounds, or both.
+StopRule = Literal["leave_one_out_error", "j_change", "both"]
 
 
 @job(name="heisenberg mapping")
@@ -92,7 +91,7 @@ def run_exchange_round(
     heisenberg_settings: dict,
     stop_rule: StopRule,
     j_tolerance: float,
-    cv_tolerance: float,
+    leave_one_out_tolerance: float,
     max_cell_size: int,
     cell_size: int,
     calculations: list[RoundCalculations],
@@ -108,9 +107,9 @@ def run_exchange_round(
     #    pymatgen raises ValueError; catch it and go to step 8?)
     # 5. model = mapper.get_heisenberg_model(); current = ExchangeRound(cell_size,
     #    len(structures), model.ex_params, model.residual,
-    #    leave_one_out_error(mapper.ex_mat)).
+    #    model.leave_one_out_error).
     # 6. If has_resolved_every_target(mapper) and has_converged(current, last of
-    #    `rounds` or None, stop_rule, j_tolerance, cv_tolerance):
+    #    `rounds` or None, stop_rule, j_tolerance, leave_one_out_tolerance):
     #    return ExchangeFit(model, rounds + [current]).
     # 7. If cell_size >= max_cell_size: warn that the J's did not converge and
     #    return ExchangeFit(model, rounds + [current]).
@@ -126,7 +125,7 @@ def queue_next_round(
     heisenberg_settings: dict,
     stop_rule: StopRule,
     j_tolerance: float,
-    cv_tolerance: float,
+    leave_one_out_tolerance: float,
     max_cell_size: int,
     cell_size: int,
     calculations: list[RoundCalculations],
@@ -215,32 +214,21 @@ def has_resolved_every_target(mapper: HeisenbergMapper) -> bool:
     raise NotImplementedError
 
 
-def leave_one_out_error(exchange_matrix: pd.DataFrame) -> float:
-    """Return the leave-one-out RMS error (meV per magnetic ion) of the exchange fit."""
-    # 1. H = the J and E0 columns, E = the "E" column of `exchange_matrix`.
-    # 2. Fit by least squares and compute the residual of each ordering.
-    # 3. Leverage h_ii = diagonal of H (H^T H)^-1 H^T; the leave-one-out residual
-    #    of ordering i is residual_i / (1 - h_ii) (open: h_ii = 1 when one ordering
-    #    alone fixes a J; return infinity?).
-    # 4. Return the RMS of the leave-one-out residuals, converted from eV to meV.
-    raise NotImplementedError
-
-
 def has_converged(
     current: ExchangeRound,
     previous: ExchangeRound | None,
     stop_rule: StopRule,
     j_tolerance: float,
-    cv_tolerance: float,
+    leave_one_out_tolerance: float,
 ) -> bool:
     """Return True if `current` meets `stop_rule` against `previous`."""
     # 1. Return False if previous is None.
     # 2. j_converged = largest_j_change(current.ex_params, previous.ex_params)
     #    <= j_tolerance (meV/muB^2).
-    # 3. cv_converged = abs(current.cv_error - previous.cv_error) <= cv_tolerance
-    #    (meV per magnetic ion) (open: test the CV error's change, or the CV error
-    #    itself against the tolerance?).
-    # 4. Return j_converged, cv_converged or both, as `stop_rule` says.
+    # 3. leave_one_out_converged = current.leave_one_out_error
+    #    <= leave_one_out_tolerance (meV per magnetic ion). Absolute, not the change
+    #    between rounds: the rounds' errors come from different sets of orderings.
+    # 4. Return j_converged, leave_one_out_converged or both, as `stop_rule` says.
     raise NotImplementedError
 
 
