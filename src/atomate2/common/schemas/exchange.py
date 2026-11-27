@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pymatgen.analysis.magnetism.heisenberg import HeisenbergModel
@@ -11,17 +11,21 @@ from pymatgen.core.structure import Structure
 if TYPE_CHECKING:
     from atomate2.vampire.schemas.vampire_output import VampireOutput
 
+# Why the convergence loop ended: the fit met the tolerance, every candidate was
+# computed, or no candidate left was worth its atoms.
+StopReason = Literal["converged", "candidates_exhausted", "not_worth_its_atoms"]
+
 # JSON has no infinity; write `Infinity` so an infinite leave-one-out error reloads.
 KEEP_INFINITY = ConfigDict(ser_json_inf_nan="constants")
 
 
 class ExchangeRound(BaseModel):
-    """Summary of the Heisenberg fit after one supercell round of orderings."""
+    """Summary of the Heisenberg fit after one round of selected orderings."""
 
     model_config = KEEP_INFINITY
 
-    cell_size: int = Field(
-        description="Supercell size, in parent cells, of this round's new orderings."
+    new_ordering_atoms: list[int] = Field(
+        description="Number of atoms in the supercell of each ordering the round added."
     )
     num_orderings: int = Field(
         description="Number of orderings the fit used, from this and earlier rounds."
@@ -49,6 +53,7 @@ class ExchangeFit(BaseModel):
     rounds: list[ExchangeRound] = Field(
         description="One summary per round, in the order the rounds ran."
     )
+    stop_reason: StopReason = Field(description="Why the loop ended.")
 
 
 class ExchangeDocument(BaseModel):
@@ -71,8 +76,7 @@ class ExchangeDocument(BaseModel):
     )
     parent_structure: Structure | None = Field(
         None,
-        description="The paramagnetic parent cell the orderings were mapped onto. "
-        "Falls back to the lowest-energy ordering only when no parent was given.",
+        description="The paramagnetic parent cell the orderings were mapped onto.",
     )
     heisenberg_settings: dict | None = Field(
         None,
@@ -91,6 +95,12 @@ class ExchangeDocument(BaseModel):
         "more orderings than fitted parameters; otherwise the fit overfits and the "
         "residual is low without the fit being good.",
     )
+    leave_one_out_error: float | None = Field(
+        None,
+        description="RMS error of predicting each ordering's energy from a fit to all "
+        "the others, in meV per magnetic ion; the measure the convergence loop stops "
+        "on, and infinite if one ordering alone fixes a J.",
+    )
     ex_params: dict | None = Field(
         None,
         description="Fitted exchange parameters keyed by interaction label. The "
@@ -106,7 +116,18 @@ class ExchangeDocument(BaseModel):
     )
     rounds: list[ExchangeRound] | None = Field(
         None,
-        description="Fit summary after each supercell round of the convergence loop.",
+        description="Fit summary after each round of the convergence loop.",
+    )
+    stop_reason: StopReason | None = Field(
+        None,
+        description="Why the convergence loop ended; only 'converged' means the fit "
+        "met leave_one_out_tolerance.",
+    )
+    loop_limits: dict[str, float] | None = Field(
+        None,
+        description="The limits of the convergence loop the fit ran with: the maker's "
+        "leave_one_out_tolerance and max_magnetic_sites, and the fixed "
+        "max_cell_size, orderings_per_parameter and atom_cost_weight.",
     )
     critical_temp: float | None = Field(
         None,
@@ -120,7 +141,10 @@ class ExchangeDocument(BaseModel):
     def from_model(
         cls,
         heisenberg_model: HeisenbergModel,
-        parent_structure: Structure | None = None,
+        parent_structure: Structure,
+        rounds: list[ExchangeRound] | None = None,
+        stop_reason: StopReason | None = None,
+        loop_limits: dict[str, float] | None = None,
         vampire_output: VampireOutput | None = None,
         vampire_settings: dict | None = None,
     ) -> ExchangeDocument:
@@ -130,18 +154,19 @@ class ExchangeDocument(BaseModel):
         ----------
         heisenberg_model : HeisenbergModel
             The fitted Heisenberg model from pymatgen's HeisenbergMapper.
-        parent_structure : Structure or None
-            The paramagnetic parent cell the model was fitted on. If None, falls back
-            to ``heisenberg_model.structures[0]``, the full cell of the lowest-energy
-            ordering (all ions retained).
+        parent_structure : Structure
+            The paramagnetic parent cell the model was fitted on.
+        rounds : list[ExchangeRound] or None
+            The fit summary of each round of the convergence loop.
+        stop_reason : StopReason or None
+            Why the convergence loop ended.
+        loop_limits : dict[str, float] or None
+            The limits of the convergence loop the fit ran with.
         vampire_output : VampireOutput or None
             The Vampire Monte-Carlo result, if the critical-temperature step was run.
         vampire_settings : dict or None
             The keyword arguments the Vampire Monte-Carlo run was called with, if run.
         """
-        if parent_structure is None:
-            parent_structure = heisenberg_model.structures[0]
-
         return cls(
             formula=parent_structure.formula,
             formula_pretty=parent_structure.composition.reduced_formula,
@@ -152,9 +177,13 @@ class ExchangeDocument(BaseModel):
             },
             vampire_settings=vampire_settings if vampire_output else None,
             residual=heisenberg_model.residual,
+            leave_one_out_error=heisenberg_model.leave_one_out_error,
             ex_params=heisenberg_model.ex_params,
             ex_mat=heisenberg_model.ex_mat.to_dict(),
             heisenberg_model=heisenberg_model.as_dict(),
+            rounds=rounds,
+            stop_reason=stop_reason,
+            loop_limits=loop_limits,
             critical_temp=vampire_output.critical_temp if vampire_output else None,
             vampire_output=vampire_output.as_dict() if vampire_output else None,
         )
