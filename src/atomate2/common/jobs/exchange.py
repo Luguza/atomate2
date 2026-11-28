@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 from jobflow import Flow, Maker, Response, job
-from pymatgen.analysis.magnetism.heisenberg import HeisenbergMapper
+from pymatgen.analysis.magnetism.analyzer import (
+    CollinearMagneticStructureAnalyzer,
+    MagneticStructureEnumerator,
+)
+from pymatgen.analysis.magnetism.heisenberg import (
+    DEFAULT_SYMPREC,
+    ComputedOrdering,
+    HeisenbergMapper,
+    ParentCell,
+)
+from pymatgen.analysis.structure_matcher import StructureMatcher
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 from atomate2.common.jobs.magnetism import run_ordering_calculations
 from atomate2.common.schemas.exchange import (
@@ -54,13 +66,13 @@ def symmetrize_to_paramagnetic_parent(structure: Structure) -> Structure:
     Experimental and relaxed geometries often keep a small distortion of the ordered
     phase, which would split the magnetic sublattices and change the targeted J's.
     """
-    # 1. structure = a copy of `structure`.
-    # 2. Remove its "magmom" site property, if any, so the spins no longer lower the
-    #    symmetry.
-    # 3. Return SpacegroupAnalyzer(structure, symprec=PARENT_SYMPREC)
-    #    .get_primitive_standard_structure(): the paramagnetic space group, as the
-    #    primitive cell.
-    raise NotImplementedError
+    structure = structure.copy()
+    # Moments, as site property or species spin, would lower the symmetry.
+    if "magmom" in structure.site_properties:
+        structure.remove_site_property("magmom")
+    structure.remove_spin()
+    analyzer = SpacegroupAnalyzer(structure, symprec=PARENT_SYMPREC)
+    return analyzer.get_primitive_standard_structure()
 
 
 # --- Candidate orderings ---
@@ -78,45 +90,70 @@ def enumerate_candidates(
     exponentially with them. Raises ValueError if the orderings cannot resolve
     every J the settings target, so a loop that cannot converge costs no DFT.
     """
-    # 1. default_magmoms = heisenberg_settings["default_magmoms"], the one source
-    #    the fit and the selection use too.
-    # 2. magnetic_sites = count_magnetic_sites(structure, default_magmoms); raise
-    #    ValueError if it is 0 or above max_magnetic_sites (a ground-state parent
-    #    is only known here).
-    # 3. largest_cell_size = min(MAX_CELL_SIZE, max_magnetic_sites // magnetic_sites).
-    # 4. enumerator = MagneticStructureEnumerator(structure, default_magmoms,
-    #    automatic=True, truncate_by_symmetry=False,
-    #    transformation_kwargs={"max_cell_size": largest_cell_size}).
-    #    - automatic=True: pymatgen adds the ferrimagnetic and motif strategies
-    #      where the structure has several magnetic species or Wyckoff positions.
-    #    - truncate_by_symmetry=False: low-symmetry orderings often separate J's
-    #      that symmetric ones cannot.
-    #    - One call over all cell sizes up to largest_cell_size, so a strategy
-    #      without orderings in the smallest cell (AFM with one magnetic site)
-    #      finds them in larger ones. pymatgen keeps at most 64 orderings per
-    #      strategy, the smaller cells first.
-    # 5. rows = selection_rows(structure, enumerator.ordered_structures,
-    #    heisenberg_settings); if their rank is below the number of columns, raise
-    #    ValueError: the candidates can fix only that many of the parameters (E0
-    #    and the J's), so the loop cannot converge and would only spend statics;
-    #    lower the cutoff or raise max_magnetic_sites.
-    # 6. Return enumerator.ordered_structures and ordered_structure_origins.
-    raise NotImplementedError
+    default_magmoms = heisenberg_settings["default_magmoms"]
+    magnetic_sites = check_magnetic_sites(
+        structure, default_magmoms, max_magnetic_sites
+    )
+
+    # truncate_by_symmetry=False: low-symmetry orderings often separate J's that
+    # symmetric ones cannot. One call over all cell sizes, so a strategy without
+    # orderings in the smallest cell finds them in larger ones.
+    enumerator = MagneticStructureEnumerator(
+        structure,
+        default_magmoms=default_magmoms,
+        automatic=True,
+        truncate_by_symmetry=False,
+        transformation_kwargs={
+            "max_cell_size": min(MAX_CELL_SIZE, max_magnetic_sites // magnetic_sites)
+        },
+    )
+
+    rows = selection_rows(structure, enumerator.ordered_structures, heisenberg_settings)
+    fixable_parameters = np.linalg.matrix_rank(rows)
+    num_parameters = rows.shape[1]
+    if fixable_parameters < num_parameters:
+        raise ValueError(
+            f"The {len(rows)} candidate orderings can fix only {fixable_parameters} "
+            f"of the {num_parameters} parameters (E0 and the J's within the cutoff), "
+            "so the loop cannot converge. Lower the cutoff in heisenberg_settings or "
+            "raise max_magnetic_sites."
+        )
+    return enumerator.ordered_structures, enumerator.ordered_structure_origins
 
 
-def count_magnetic_sites(
-    structure: Structure, default_magmoms: dict[str, float] | None
+def check_magnetic_sites(
+    structure: Structure,
+    default_magmoms: dict[str, float] | None,
+    max_magnetic_sites: int,
 ) -> int:
-    """Return how many primitive-cell sites carry a moment under `default_magmoms`.
+    """Return the magnetic sites of the primitive `structure`, if it can be enumerated.
 
-    The primitive cell, because the parent the orderings are enumerated on is one.
+    Raises ValueError if it has none, or more than `max_magnetic_sites`.
     """
-    # 1. analyzer = CollinearMagneticStructureAnalyzer(structure,
-    #    overwrite_magmom_mode="replace_all", default_magmoms=default_magmoms);
-    #    by keyword, as the second positional argument is overwrite_magmom_mode.
-    #    The analyzer reduces `structure` to its primitive cell by default.
-    # 2. Return analyzer.number_of_magnetic_sites.
-    raise NotImplementedError
+    magnetic_sites = magnetic_analyzer(
+        structure, default_magmoms
+    ).number_of_magnetic_sites
+    if magnetic_sites == 0:
+        raise ValueError(
+            f"{structure.reduced_formula} has no magnetic site under default_magmoms."
+        )
+    if magnetic_sites > max_magnetic_sites:
+        raise ValueError(
+            f"The primitive cell of {structure.reduced_formula} has {magnetic_sites} "
+            f"magnetic sites, more than max_magnetic_sites={max_magnetic_sites}, so "
+            "not even its own orderings are enumerated. Raise max_magnetic_sites."
+        )
+    return magnetic_sites
+
+
+def magnetic_analyzer(
+    structure: Structure, default_magmoms: dict[str, float] | None
+) -> CollinearMagneticStructureAnalyzer:
+    """Return an analyzer of primitive `structure`, moments set by `default_magmoms`."""
+    # By keyword: the second positional argument is overwrite_magmom_mode.
+    return CollinearMagneticStructureAnalyzer(
+        structure, overwrite_magmom_mode="replace_all", default_magmoms=default_magmoms
+    )
 
 
 # --- Convergence loop over rounds of selected orderings ---
@@ -133,52 +170,82 @@ def run_exchange_round(
     rounds: list[ExchangeRound],
 ) -> Response | ExchangeFit:
     """Fit the orderings so far on `structure`; return the fit or queue a new round."""
-    # 1. If `calculations` is not empty:
-    #    a. structures, energies = collect_orderings(calculations)
-    #    b. mapper = HeisenbergMapper(structures, energies, structure,
-    #       **heisenberg_settings); not caught: pymatgen raises ValueError only for
-    #       fewer than 2 distinct orderings or no J at all, and the first round
-    #       selects at least as many distinct orderings as parameters (the prior
-    #       makes those worth far more than any atom cost).
-    #    c. model = mapper.get_heisenberg_model(); current = ExchangeRound(atoms of
-    #       each ordering the last round added, len(structures), model.ex_params,
-    #       model.residual, model.leave_one_out_error).
-    #    d. every_target_resolved = set(mapper.dists) <= set(mapper.ex_mat.columns);
-    #       pymatgen drops a J the orderings cannot separate from the shorter
-    #       ones with only a warning, and the fit of the rest can still meet the
-    #       tolerance.
-    #    e. If every_target_resolved and current.leave_one_out_error
-    #       <= leave_one_out_tolerance (meV per magnetic ion; pymatgen gives
-    #       infinity while the orderings cannot fix every J): return
-    #       ExchangeFit(model, rounds + [current], stop_reason="converged").
-    #       Idea, untested: a fixed meV threshold passes too easily for weak magnets
-    #       whose orderings lie within a few meV; dividing the error by the spread
-    #       of the ordering energies would scale it to the material.
-    # 2. selected, remaining = select_orderings(structure, candidates, structures
-    #    (none before the first round), heisenberg_settings)
-    # 3. If nothing is selected (only after a fit: enumerate_candidates already
-    #    raised on a pool too small for the first round):
-    #    a. stop_reason = "candidates_exhausted" if no candidates are left, else
-    #       "not_worth_its_atoms".
-    #    b. Warn that the J's did not converge, naming stop_reason, the last
-    #       leave-one-out error and leave_one_out_tolerance, and what to try: if the
-    #       DFT noise is near the tolerance, raise leave_one_out_tolerance; if
-    #       exchange beyond the cutoff may matter, rerun with a larger cutoff in
-    #       heisenberg_settings; if the candidates ran out, raise max_magnetic_sites.
-    #    c. Return ExchangeFit(model, rounds + [current], stop_reason).
-    # Next round: this job replaces itself with the statics of `selected` and a new
-    # round, so its output becomes the final ExchangeFit.
-    # 4. statics_job = run_ordering_calculations(selected, static_maker,
-    #    relax_maker=None)
-    #    DECISION 4: commensurate k-point meshes per supercell plug in here, on the
-    #    static inputs of each ordering.
-    # 5. next_round_job = run_exchange_round(structure, static_maker,
-    #    heisenberg_settings, leave_one_out_tolerance, candidates=remaining,
-    #    calculations=calculations + [statics_job.output],
-    #    rounds=rounds + [current]).
-    # 6. Return Response(replace=Flow([statics_job, next_round_job],
-    #    output=next_round_job.output)).
-    raise NotImplementedError
+    known_structures: list[Structure] = []
+    model: HeisenbergModel | None = None
+    if calculations:
+        known_structures, energies = collect_orderings(calculations)
+        # Not caught: pymatgen raises only for fewer than 2 distinct orderings or no
+        # J at all, and the first round selects at least one ordering per parameter.
+        mapper = HeisenbergMapper(
+            known_structures, energies, structure, **heisenberg_settings
+        )
+        model = mapper.get_heisenberg_model()
+        rounds = [*rounds, summarize_round(model, calculations[-1])]
+
+        # pymatgen drops a J the orderings cannot separate with only a warning, and
+        # the fit of the remaining J's can still meet the tolerance.
+        every_target_resolved = set(mapper.dists) <= set(mapper.ex_mat.columns)
+        if (
+            every_target_resolved
+            and model.leave_one_out_error <= leave_one_out_tolerance
+        ):
+            return ExchangeFit(
+                heisenberg_model=model, rounds=rounds, stop_reason="converged"
+            )
+
+    selected, remaining = select_orderings(
+        structure, candidates, known_structures, heisenberg_settings
+    )
+    if not selected[0]:
+        if model is None:
+            raise ValueError("No candidate ordering to start the loop with.")
+        stop_reason: StopReason = (
+            "not_worth_its_atoms" if remaining[0] else "candidates_exhausted"
+        )
+        warnings.warn(
+            f"The J's did not converge ({stop_reason}): the leave-one-out error is "
+            f"{model.leave_one_out_error:.3g} meV per magnetic ion, above "
+            f"leave_one_out_tolerance={leave_one_out_tolerance}. If the DFT noise is "
+            "near the tolerance, raise leave_one_out_tolerance; if exchange beyond "
+            "the cutoff may matter, rerun with a larger cutoff in "
+            "heisenberg_settings; if the candidates ran out, raise "
+            "max_magnetic_sites.",
+            stacklevel=2,
+        )
+        return ExchangeFit(
+            heisenberg_model=model, rounds=rounds, stop_reason=stop_reason
+        )
+
+    # DECISION 4: commensurate k-point meshes per supercell plug in here, on the
+    # static inputs of each ordering.
+    statics_job = run_ordering_calculations(selected, static_maker, relax_maker=None)
+    next_round_job = run_exchange_round(
+        structure,
+        static_maker,
+        heisenberg_settings,
+        leave_one_out_tolerance,
+        candidates=remaining,
+        calculations=[*calculations, statics_job.output],
+        rounds=rounds,
+    )
+    return Response(
+        replace=Flow([statics_job, next_round_job], output=next_round_job.output)
+    )
+
+
+def summarize_round(
+    model: HeisenbergModel, last_round: RoundCalculations
+) -> ExchangeRound:
+    """Return the summary of `model`, fitted after `last_round` added its orderings."""
+    return ExchangeRound(
+        new_ordering_atoms=[
+            len(task.structure) for task, _metadata, _uuid in last_round
+        ],
+        num_orderings=len(model.structures),
+        ex_params=model.ex_params,
+        residual=model.residual,
+        leave_one_out_error=model.leave_one_out_error,
+    )
 
 
 # --- Selecting informative orderings ---
@@ -192,22 +259,46 @@ def select_orderings(
 ) -> tuple[Orderings, Orderings]:
     """Pick the candidates that add the most information per atom to the fit.
 
-    Returns the selected and the remaining candidates.
+    Greedy D-optimal design: each pick maximizes the gain in log det(X^T X) minus
+    its atom cost. Returns the selected and the remaining candidates.
     """
-    # 1. known_rows = selection_rows(structure, known_structures,
-    #    heisenberg_settings); candidate_rows = selection_rows(structure,
-    #    candidates' structures, heisenberg_settings).
-    # 2. information = known_rows.T @ known_rows + SELECTION_PRIOR * identity.
-    # 3. Up to ORDERINGS_PER_PARAMETER * the number of parameters (columns of the
-    #    rows) times:
-    #    a. Score each candidate row x: log(1 + x @ inverse(information) @ x), its
-    #       gain in log det(X^T X), minus ATOM_COST_WEIGHT * its atoms in parent
-    #       cells' worth (len(candidate) / len(structure)).
-    #    b. Stop if the best score is <= 0: no candidate is worth its atoms.
-    #    c. Move the best candidate from the remaining to the selected;
-    #       information += outer(x, x).
-    # 4. Return the selected and the remaining candidates, each with its origins.
-    raise NotImplementedError
+    candidate_structures, _origins = candidates
+    rows = selection_rows(
+        structure, [*known_structures, *candidate_structures], heisenberg_settings
+    )
+    known_rows, candidate_rows = np.split(rows, [len(known_structures)])
+    num_parameters = rows.shape[1]
+    information = known_rows.T @ known_rows + SELECTION_PRIOR * np.identity(
+        num_parameters
+    )
+    parent_cells = [
+        len(candidate) / len(structure) for candidate in candidate_structures
+    ]
+
+    remaining = list(range(len(candidate_structures)))
+    selected: list[int] = []
+    while remaining and len(selected) < ORDERINGS_PER_PARAMETER * num_parameters:
+        scores = [
+            np.log1p(
+                candidate_rows[i] @ np.linalg.solve(information, candidate_rows[i])
+            )
+            - ATOM_COST_WEIGHT * parent_cells[i]
+            for i in remaining
+        ]
+        best = int(np.argmax(scores))
+        if scores[best] <= 0:
+            break
+        chosen = remaining.pop(best)
+        selected.append(chosen)
+        information += np.outer(candidate_rows[chosen], candidate_rows[chosen])
+
+    return take(candidates, selected), take(candidates, remaining)
+
+
+def take(orderings: Orderings, indices: list[int]) -> Orderings:
+    """Return the orderings at `indices`, with their origins."""
+    structures, origins = orderings
+    return [structures[i] for i in indices], [origins[i] for i in indices]
 
 
 def selection_rows(
@@ -215,18 +306,34 @@ def selection_rows(
 ) -> np.ndarray:
     """Return one design-matrix row per ordering: 1 for E0, then its spin signs per J.
 
-    Every J the settings target gets a column, also those no ordering resolves yet.
+    Every J the settings target gets a column, shortest first, also those no ordering
+    resolves yet. Signs, because the moments are unknown before the static.
     """
-    # 1. parent = ParentCell(structure, magnetic species, cutoff and symprec from
-    #    heisenberg_settings) (open: ParentCell and ComputedOrdering are not in
-    #    pymatgen's documented API; ask to make them public?).
-    # 2. For each ordering: ComputedOrdering(ordering, energy=0.0, parent=parent,
-    #    matcher=...).spin_products(signs_only=True); the energy is unused, as
-    #    only the spin products are read, and signs, because the moments are
-    #    unknown before the static.
-    # 3. Return the rows with E0 = 1 first and one column per J, shortest first, zero
-    #    where an ordering has no bond of that J.
-    raise NotImplementedError
+    default_magmoms = heisenberg_settings["default_magmoms"]
+    magnetic_species = {
+        species.symbol
+        for species in magnetic_analyzer(
+            structure, default_magmoms
+        ).types_of_magnetic_species
+    }
+    parent = ParentCell(
+        structure,
+        magnetic_species,
+        cutoff=heisenberg_settings.get("cutoff", 0),
+        symprec=heisenberg_settings.get("symprec", DEFAULT_SYMPREC),
+    )
+    matcher = heisenberg_settings.get("matcher") or StructureMatcher(
+        primitive_cell=False, attempt_supercell=True
+    )
+
+    rows = []
+    for ordering in orderings:
+        # The energy is unused: only the spin products are read.
+        computed = ComputedOrdering(
+            ordering, 0.0, parent, matcher, default_magmoms=default_magmoms
+        )
+        rows.append([1.0, *computed.spin_products(signs_only=True).values()])
+    return np.array(rows).reshape(len(orderings), 1 + len(parent.interactions))
 
 
 # --- Fitting the orderings ---
@@ -235,14 +342,15 @@ def selection_rows(
 def collect_orderings(
     calculations: list[RoundCalculations],
 ) -> tuple[list[Structure], list[float]]:
-    """Return the structures with their output moments and their total energies."""
-    # 1. For each task of each round: ordering = MagneticOrderingOutput
-    #    .from_task_document(task), the schema for a static ordering calculation.
-    # 2. Copy ordering.structure and add ordering.magmoms, the output moments, as
-    #    the "magmom" site property; a static that flipped spins or lost moment is
-    #    then fitted as the state it actually converged to.
-    # 3. Return the structures and the ordering.energy values.
-    raise NotImplementedError
+    """Return the output structures, with their moments, and their total energies.
+
+    Fitted on the output moments, a static that flipped spins or lost moment counts
+    as the state it converged to.
+    """
+    tasks = [
+        task for round_tasks in calculations for task, _metadata, _uuid in round_tasks
+    ]
+    return [task.structure for task in tasks], [task.output.energy for task in tasks]
 
 
 @job(name="build exchange doc")

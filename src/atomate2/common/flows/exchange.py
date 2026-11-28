@@ -12,7 +12,7 @@ from atomate2.common.jobs.exchange import (
     MAX_CELL_SIZE,
     ORDERINGS_PER_PARAMETER,
     build_exchange_doc,
-    count_magnetic_sites,
+    check_magnetic_sites,
     enumerate_candidates,
     run_exchange_round,
     symmetrize_to_paramagnetic_parent,
@@ -21,6 +21,7 @@ from atomate2.vasp.jobs.core import StaticMaker
 from atomate2.vasp.sets.core import StaticSetGenerator
 
 if TYPE_CHECKING:
+    from jobflow import Job
     from pymatgen.core.structure import Structure
 
     from atomate2.common.flows.magnetism import MagneticOrderingsMaker
@@ -101,65 +102,82 @@ class ExchangeMaker(Maker):
 
     def make(self, structure: Structure) -> Flow:
         """Return a flow that fits exchange parameters on `structure`."""
-        # Fail at build time on what is known now: the settings and the input
-        # structure. The fitted parent comes out of a job and is only a reference
-        # here, so enumerate_candidates repeats the site check on it.
-        # 1. self._check_inputs(structure)
-        # 2. jobs = []
-        #
-        # Reference geometry: the input structure or the ground state, symmetrized
-        # the same way on both paths.
-        # 3. If self.ground_state_maker is None: geometry = structure.
-        # 4. Else: search_flow = self.ground_state_maker.make(structure), which
-        #    enumerates, relaxes and statically computes orderings and outputs a
-        #    MagneticOrderingsDocument; jobs.append(search_flow);
-        #    geometry = search_flow.output.ground_state_structure.
-        # 5. parent_job = symmetrize_to_paramagnetic_parent(geometry);
-        #    jobs.append(parent_job); parent = parent_job.output.
-        #
-        # 6. heisenberg_settings = {**self.heisenberg_settings,
-        #    "default_magmoms": self.default_magmoms}, a new dict, so the maker's
-        #    own settings stay unchanged.
-        #
-        # Candidate orderings, enumerated once without DFT.
-        # 7. candidates_job = enumerate_candidates(parent, heisenberg_settings,
-        #    self.max_magnetic_sites); jobs.append(candidates_job).
-        #
-        # Convergence loop: the round job selects orderings, runs their statics and
-        # replaces itself with the next round until the fit converges, so its
-        # output is the final ExchangeFit.
-        # 8. round_job = run_exchange_round(parent, self.static_maker,
-        #    heisenberg_settings, self.leave_one_out_tolerance,
-        #    candidates=candidates_job.output, calculations=[], rounds=[]);
-        #    jobs.append(round_job).
-        #
-        # Optional critical temperature from the fitted model.
-        # 9. vampire_output = vampire_settings = None. If self.vampire_maker:
-        #    vampire_job = self.vampire_maker.make(round_job.output.heisenberg_model);
-        #    jobs.append(vampire_job); vampire_output = vampire_job.output;
-        #    vampire_settings = self.vampire_maker.mc_settings.
-        #
-        # Summary document.
-        # 10. loop_limits = {"leave_one_out_tolerance": self.leave_one_out_tolerance,
-        #    "max_magnetic_sites": self.max_magnetic_sites,
-        #    "max_cell_size": MAX_CELL_SIZE,
-        #    "orderings_per_parameter": ORDERINGS_PER_PARAMETER,
-        #    "atom_cost_weight": ATOM_COST_WEIGHT}
-        # 11. doc_job = build_exchange_doc(round_job.output.heisenberg_model,
-        #     parent_structure=parent, rounds=round_job.output.rounds,
-        #     stop_reason=round_job.output.stop_reason, loop_limits=loop_limits,
-        #     vampire_output=vampire_output, vampire_settings=vampire_settings);
-        #     jobs.append(doc_job).
-        # 12. Return Flow(jobs, output=doc_job.output,
-        #     name=f"{self.name} ({structure.composition.reduced_formula})").
-        raise NotImplementedError
+        # The parent below is only a job reference, so enumerate_candidates repeats
+        # the site check on it.
+        self._check_inputs(structure)
+        jobs: list[Job | Flow] = []
+
+        geometry = structure
+        if self.ground_state_maker is not None:
+            search_flow = self.ground_state_maker.make(structure)
+            jobs.append(search_flow)
+            geometry = search_flow.output.ground_state_structure
+        parent_job = symmetrize_to_paramagnetic_parent(geometry)
+        jobs.append(parent_job)
+        parent = parent_job.output
+
+        heisenberg_settings = {
+            **self.heisenberg_settings,
+            "default_magmoms": self.default_magmoms,
+        }
+        candidates_job = enumerate_candidates(
+            parent, heisenberg_settings, self.max_magnetic_sites
+        )
+        jobs.append(candidates_job)
+
+        # Replaces itself round by round, so its output is the final ExchangeFit.
+        round_job = run_exchange_round(
+            parent,
+            self.static_maker,
+            heisenberg_settings,
+            self.leave_one_out_tolerance,
+            candidates=candidates_job.output,
+            calculations=[],
+            rounds=[],
+        )
+        jobs.append(round_job)
+        heisenberg_model = round_job.output.heisenberg_model
+
+        vampire_output = vampire_settings = None
+        if self.vampire_maker is not None:
+            vampire_job = self.vampire_maker.make(heisenberg_model)
+            jobs.append(vampire_job)
+            vampire_output = vampire_job.output
+            vampire_settings = self.vampire_maker.mc_settings
+
+        doc_job = build_exchange_doc(
+            heisenberg_model,
+            parent_structure=parent,
+            rounds=round_job.output.rounds,
+            stop_reason=round_job.output.stop_reason,
+            loop_limits={
+                "leave_one_out_tolerance": self.leave_one_out_tolerance,
+                "max_magnetic_sites": self.max_magnetic_sites,
+                "max_cell_size": MAX_CELL_SIZE,
+                "orderings_per_parameter": ORDERINGS_PER_PARAMETER,
+                "atom_cost_weight": ATOM_COST_WEIGHT,
+            },
+            vampire_output=vampire_output,
+            vampire_settings=vampire_settings,
+        )
+        jobs.append(doc_job)
+
+        return Flow(
+            jobs,
+            output=doc_job.output,
+            name=f"{self.name} ({structure.composition.reduced_formula})",
+        )
 
     def _check_inputs(self, structure: Structure) -> None:
         """Raise ValueError if the settings or `structure` cannot start the loop."""
-        # 1. Raise if self.leave_one_out_tolerance <= 0.
-        # 2. Raise if "default_magmoms" is in self.heisenberg_settings: make sets it
-        #    from the maker field and would silently overwrite it.
-        # 3. magnetic_sites = count_magnetic_sites(structure, self.default_magmoms)
-        # 4. Raise if it is 0, or above self.max_magnetic_sites: then not even the
-        #    parent cell is enumerated.
-        raise NotImplementedError
+        if self.leave_one_out_tolerance <= 0:
+            raise ValueError(
+                "leave_one_out_tolerance must be positive, got "
+                f"{self.leave_one_out_tolerance}."
+            )
+        if "default_magmoms" in self.heisenberg_settings:
+            raise ValueError(
+                "Set default_magmoms on the maker, not in heisenberg_settings: make "
+                "would overwrite it there."
+            )
+        check_magnetic_sites(structure, self.default_magmoms, self.max_magnetic_sites)

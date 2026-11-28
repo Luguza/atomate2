@@ -141,7 +141,8 @@ strict = [
     "numpy<3.0",
     "numba>=0.60.0", # needed to get numpy >2,<3 installed
     # TODO: pin the first release containing pymatgen#4700 (the exchange workflow)
-    "pymatgen @ git+https://github.com/materialsproject/pymatgen@70aa97c7782eed51a41725788f5ddd53e6838003",
+    # and the leave-one-out error of the Heisenberg fit; until then, the fork's branch.
+    "pymatgen @ git+https://github.com/Luguza/pymatgen@592a5abebea76c478bc1d0e0dd2c02544ce6bfe0",
     "pymatgen-core==2026.10.16",
 ]
 

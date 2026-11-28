@@ -64,7 +64,7 @@ class VampireMaker(Maker):
 
     def make(self, heisenberg_model: HeisenbergModel) -> Job:
         """Return a job that runs Vampire on `heisenberg_model`."""
-        # 1. Return run_vampire(heisenberg_model, self.mc_settings), renamed to
-        #    self.name (open: once pymatgen #4786 lands, pymatgen writes and parses
-        #    the files and this job only runs SETTINGS.VAMPIRE_CMD).
-        raise NotImplementedError
+        # TODO: once pymatgen #4786 lands, this job only runs SETTINGS.VAMPIRE_CMD.
+        vampire_job = run_vampire(heisenberg_model, self.mc_settings)
+        vampire_job.name = self.name
+        return vampire_job
